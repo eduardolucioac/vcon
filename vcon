@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Serial console of a libvirt VM, with its name on the terminal tab title.
+#
+# Konsole switches to the "remote tab title format" when it detects SSH (via a
+# hardcoded SSHProcessInfo class), but has no equivalent for virsh -- the tab
+# just stays "~ : virsh". This wrapper fills the title in and restores it on exit.
+#
+# Usage:  vcon [vm-name]        with no argument, shows a menu
+set -uo pipefail
+CONF="qemu:///system"
+
+kon() {
+    : 'Talk to the Konsole of this terminal through D-Bus.
+
+    Stays quiet and gives up when there is no Konsole around, so that the script
+    keeps working on any other terminal.
+
+    Args:
+        ARGUMENTS (str): Method and arguments to hand to the Konsole session.
+
+    Returns:
+        1 when there is no Konsole to talk to.'
+
+    [[ -n ${KONSOLE_DBUS_SERVICE:-} && -n ${KONSOLE_DBUS_SESSION:-} ]] || return 1
+    command -v qdbus6 &>/dev/null || return 1
+    qdbus6 "$KONSOLE_DBUS_SERVICE" "$KONSOLE_DBUS_SESSION" "$@" 2>/dev/null
+}
+
+# Save the current title to put back on exit. Re-applying the *format* does not
+# work: after a setTitle, Konsole keeps that text until something overwrites it.
+ORIG_TITLE="$(kon title 1)" || true
+[[ -n ${ORIG_TITLE:-} ]] || ORIG_TITLE="$(basename "${SHELL:-bash}")"
+
+set_title() {
+    : 'Put a text on the tab title.
+
+    D-Bus is used when there is a Konsole, and the OSC escape sequences cover the
+    other terminals. The sequences are only emitted on a terminal, otherwise they
+    would show up as garbage in a pipe or a file.
+
+    Args:
+        TITLE (str): Text to display.'
+
+    kon setTitle 1 "$1" > /dev/null || true
+    [[ -t 1 ]] && printf '\033]30;%s\007\033]0;%s\007' "$1" "$1"
+}
+
+restore_title() {
+    : 'Put the original title back.'
+
+    kon setTitle 1 "$ORIG_TITLE" > /dev/null || true
+    [[ -t 1 ]] && printf '\033]30;%s\007\033]0;%s\007' "$ORIG_TITLE" "$ORIG_TITLE"
+}
+
+reachable() {
+    : 'Tell whether a VM can be reached through "virsh console".
+
+    "ttyconsole" gives back nothing both for a stopped VM and for one without a pty
+    console, so a single call covers "running and reachable".
+
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        0 when it can be reached, 1 otherwise.'
+
+    [[ -n $(virsh -c "$CONF" ttyconsole "$1" 2> /dev/null) ]]
+}
+
+ip_of() {
+    : 'Find the IP a VM was given by the DHCP of the default network.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        The IP, on the standard output. Empty when there is no lease, which is the
+    case right after booting and for VMs on another network.'
+
+    local mac
+    mac=$(virsh -c "$CONF" domiflist "$1" 2>/dev/null | awk 'NR>2 && NF {print $5; exit}')
+    [[ -n $mac ]] || return 0
+    virsh -c "$CONF" net-dhcp-leases default 2>/dev/null \
+        | awk -v m="$mac" '$0 ~ m {print $5}' | cut -d/ -f1
+}
+
+vm="${1:-}"
+if [[ -z $vm ]]; then
+    vms=()
+    while read -r n; do [[ -n $n ]] && reachable "$n" && vms+=("$n"); done \
+        < <(virsh -c "$CONF" list --name 2>/dev/null | sort)
+    if (( ${#vms[@]} == 0 )); then
+        echo "No running VM with a console available."
+        exit 1
+    fi
+    if (( ${#vms[@]} == 1 )); then
+        vm="${vms[0]}"                       # only one: no point asking
+    else
+        echo "Running VMs with a console available:"
+        for i in "${!vms[@]}"; do
+            printf "  %2d) %-48s %s\n" $((i+1)) "${vms[$i]}" "$(ip_of "${vms[$i]}")"
+        done
+        read -rp "number: " n
+        [[ $n =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#vms[@]} )) || { echo "Invalid choice."; exit 1; }
+        vm="${vms[$((n-1))]}"
+    fi
+else
+    virsh -c "$CONF" domstate "$vm" &>/dev/null || { echo "VM '$vm' does not exist."; exit 1; }
+    reachable "$vm" || { echo "VM '$vm' is not running or has no pty console."; exit 1; }
+fi
+
+ip=$(ip_of "$vm")
+trap restore_title EXIT INT TERM
+set_title "(console) ${vm}${ip:+ $ip}"
+echo "Connecting to $vm${ip:+ ($ip)} -- exit with Ctrl + ]"
+virsh -c "$CONF" console "$vm" --force
+
+# vcon "inverted (c)" BSD-3-Clause
+# Eduardo Lucio Amorim Costa
+# Brazil-DF
+# https://www.linkedin.com/in/eduardo-software-livre/
