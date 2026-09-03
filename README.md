@@ -50,7 +50,8 @@ So `vcon` fills the title in itself, and puts it back when you leave.
 
 1. It lists every machine that has a **console device in its domain XML**,
    marked `[running]` or `[shutoff]`, with the IP each running one got from the
-   DHCP of the `default` network;
+   DHCP of the `default` network. That whole survey is **two calls to virsh**,
+   however many machines there are;
 2. You pick one;
 3. If it is switched off, it is **started**, and the script waits for the console
    to come up — the pty appears a moment after the machine does, and attaching
@@ -213,9 +214,14 @@ Host my-kvm-host
     ControlPersist 10m
 ```
 
-**This matters more than it looks.** Building the list opens a connection per
-question — four per machine. Left to prompt, that is four passwords per VM just
-to draw a menu. A key asks nothing; `ControlMaster` asks once.
+**This matters more than it looks.** Left to prompt, every connection is a
+password, so it is worth having none of them asked. A key asks nothing;
+`ControlMaster` asks once.
+
+Building the list is **two calls to virsh**, whatever the number of machines —
+one for the names, one for everything else. It used to be four per machine, which
+is invisible on a local socket and painful over SSH, where each one is a fresh
+handshake.
 
 ### What the IP column means on a remote host
 

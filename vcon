@@ -93,8 +93,27 @@ has_console() {
     virsh -c "$CONF" dumpxml "$1" 2> /dev/null | grep -q "<console type='pty'"
 }
 
+ip_of() {
+    : 'Find the IP a VM was given by the DHCP of the default network.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        The IP, on the standard output. Empty when there is no lease.'
+
+    local MAC_VALUE
+    MAC_VALUE=$(virsh -c "$CONF" domiflist "$1" 2>/dev/null | awk 'NR>2 && NF {print $5; exit}')
+    [[ -n $MAC_VALUE ]] || return 0
+    virsh -c "$CONF" net-dhcp-leases default 2>/dev/null \
+        | awk -v m="$MAC_VALUE" '$0 ~ m {print $5}' | cut -d/ -f1
+}
+
 state_of() {
-    : 'Give the state of a VM as a single word.
+    : 'Give the state of a single VM as a single word.
+
+    Used on the machine that was picked, not while building the list -- that one
+    gets every state in the same batch as everything else.
 
     Args:
         VM_NAME (str): Name of the domain.
@@ -108,21 +127,76 @@ state_of() {
     printf '%s' "${STATE_VALUE// /}"
 }
 
-ip_of() {
-    : 'Find the IP a VM was given by the DHCP of the default network.
+survey_vms() {
+    : 'Collect everything the list needs, in two calls to virsh.
 
-    Args:
-        VM_NAME (str): Name of the domain.
+    Asking per VM meant a connection per question -- four of them, times the
+    number of machines. That is invisible on a local socket and painful over SSH,
+    where every one of them is a fresh handshake and, without a key, a fresh
+    password prompt. Two calls now, whatever the number of machines.
+
+    Three things made it possible: "dumpxml" already carries the MAC, so
+    "domiflist" was never needed; the DHCP leases are one table for everybody, not
+    one lookup per VM; and virsh runs a whole script of commands over a single
+    connection when it is fed through the standard input.
 
     Returns:
-        The IP, on the standard output. Empty when there is no lease, which is the
-    case for a stopped VM, right after booting, and for VMs on another network.'
+        One line per VM with a console, on the standard output, as
+    "NAME<tab>STATE<tab>IP". IP is empty when there is no lease.'
 
-    local MAC_VALUE
-    MAC_VALUE=$(virsh -c "$CONF" domiflist "$1" 2>/dev/null | awk 'NR>2 && NF {print $5; exit}')
-    [[ -n $MAC_VALUE ]] || return 0
-    virsh -c "$CONF" net-dhcp-leases default 2>/dev/null \
-        | awk -v m="$MAC_VALUE" '$0 ~ m {print $5}' | cut -d/ -f1
+    local NAMES_VALUE BATCH_VALUE OUT_VALUE
+
+    NAMES_VALUE="$(virsh -q -c "$CONF" list --all --name 2> /dev/null | grep '[^[:space:]]')"
+    [ -n "$NAMES_VALUE" ] || return 0
+
+    # One script, one connection. The markers are what tells whose answer is
+    # whose on the way back, since virsh writes everything into a single stream.
+    BATCH_VALUE="net-dhcp-leases default"$'\n'
+    while IFS= read -r VM_NOW; do
+        BATCH_VALUE+="echo VCONSEP${VM_NOW}VCONSEP"$'\n'
+        BATCH_VALUE+="domstate ${VM_NOW}"$'\n'
+        BATCH_VALUE+="dumpxml ${VM_NOW}"$'\n'
+    done <<< "$NAMES_VALUE"
+
+    OUT_VALUE="$(printf '%s' "$BATCH_VALUE" | virsh -q -c "$CONF" 2> /dev/null)"
+
+    # NOTE: The prompts virsh writes ("virsh # ") are left where they are. Nothing
+    # is parsed positionally here -- each line is recognised by what it holds --
+    # so they are simply never matched by anything.
+    printf '%s' "$OUT_VALUE" | awk '
+        # The leases table comes first, before any marker: MAC -> IP.
+        /^VCONSEP/ { seen_first = 1 }
+        !seen_first && $0 ~ /([0-9a-f]{2}:){5}[0-9a-f]{2}/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) mac_field = i
+                if ($i ~ /^[0-9.]+\/[0-9]+$/) { split($i, a, "/"); ip_field = a[1] }
+            }
+            if (mac_field && ip_field) lease[$mac_field] = ip_field
+            mac_field = 0; ip_field = ""
+        }
+        # From here on, a marker opens the answers of one machine.
+        {
+            if (match($0, /VCONSEP.*VCONSEP/)) {
+                name = substr($0, RSTART + 7, RLENGTH - 14)
+                next
+            }
+        }
+        name == "" { next }
+        # "domstate" answers with one bare word, on its own line.
+        $0 ~ /^(running|shut off|paused|idle|in shutdown|crashed|pmsuspended)$/ {
+            state[name] = $0; gsub(/ /, "", state[name]); next
+        }
+        /<console type=.pty./ { console[name] = 1 }
+        /<mac address=/ {
+            if (match($0, /([0-9a-f]{2}:){5}[0-9a-f]{2}/) && !(name in mac))
+                mac[name] = substr($0, RSTART, RLENGTH)
+        }
+        END {
+            for (n in console)
+                printf "%s\t%s\t%s\n", n, (n in state ? state[n] : "?"),
+                       (n in mac && mac[n] in lease ? lease[mac[n]] : "")
+        }
+    ' | LC_ALL=C sort
 }
 
 ensure_running() {
@@ -163,13 +237,11 @@ vm="${1:-}"
 if [[ -z $vm ]]; then
     vms=()
     labels=()
-    while read -r n; do
+    while IFS=$'\t' read -r n st ip; do
         [[ -n $n ]] || continue
-        has_console "$n" || continue
-        st="$(state_of "$n")"
         vms+=("$n")
-        labels+=("$(printf '%-48s %-18s [%s]' "$n" "$(ip_of "$n")" "$st")")
-    done < <(virsh -c "$CONF" list --all --name 2>/dev/null | sort)
+        labels+=("$(printf '%-48s %-18s [%s]' "$n" "$ip" "$st")")
+    done < <(survey_vms)
 
     if (( ${#vms[@]} == 0 )); then
         echo "No VM with a console available."
