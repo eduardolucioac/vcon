@@ -1,3 +1,10 @@
+# The local configuration holds the addresses and paths of the machine it runs on,
+# so nothing inside "configs" is tracked, apart from the model. The rule is scoped
+# to that folder on purpose: a name based rule would let a config named after a
+# project file slip into a commit.
+/configs/*
+!/configs/config_model.bash
+
 # Backup copies.
 *_BAK
 *.bak

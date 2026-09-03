@@ -1,13 +1,38 @@
 #!/usr/bin/env bash
-# Serial console of a libvirt VM, with its name on the terminal tab title.
+
+# vcon - Serial console of a libvirt VM, with its name on the terminal tab title.
 #
 # Konsole switches to the "remote tab title format" when it detects SSH (via a
-# hardcoded SSHProcessInfo class), but has no equivalent for virsh -- the tab
-# just stays "~ : virsh". This wrapper fills the title in and restores it on exit.
+# hardcoded SSHProcessInfo class), but has no equivalent for virsh -- the tab just
+# stays "~ : virsh". This fills the title in and restores it on exit.
+#
+# It also lists what you can connect to, running or not, and starts a stopped one
+# for you.
 #
 # Usage:  vcon [vm-name]        with no argument, shows a menu
+
 set -uo pipefail
-CONF="qemu:///system"
+
+# Real path of this script, with every symbolic link resolved. It matters when it
+# is called through a link in a "bin" folder: without resolving the link, the
+# configuration would be looked for beside the link instead of beside the script.
+VCON_PATH="$(readlink -f "$0" 2> /dev/null || echo "$0")"
+VCON_DIR="$(cd "$(dirname "$VCON_PATH")" && pwd)"
+CONFIG_FILE="$VCON_DIR/configs/config.bash"
+CONFIG_MODEL="$VCON_DIR/configs/config_model.bash"
+
+# The configuration is optional: the defaults below are what a local libvirt
+# wants, and that is the common case. Copy the model only when yours differs.
+# shellcheck source=/dev/null
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+CONF="${LIBVIRT_URI:-qemu:///system}"
+START_TIMEOUT="${START_TIMEOUT:-90}"
+
+# Credentials are libvirt's business, not this script's. Pointing at its auth file
+# is all that is needed; inventing a way to carry a password around here would be
+# both redundant and worse.
+[ -n "${LIBVIRT_AUTH_FILE:-}" ] && export LIBVIRT_AUTH_FILE
 
 kon() {
     : 'Talk to the Konsole of this terminal through D-Bus.
@@ -52,19 +77,35 @@ restore_title() {
     [[ -t 1 ]] && printf '\033]30;%s\007\033]0;%s\007' "$ORIG_TITLE" "$ORIG_TITLE"
 }
 
-reachable() {
-    : 'Tell whether a VM can be reached through "virsh console".
+has_console() {
+    : 'Tell whether a VM is wired for a serial console.
 
-    "ttyconsole" gives back nothing both for a stopped VM and for one without a pty
-    console, so a single call covers "running and reachable".
+    The domain XML is read rather than "ttyconsole", which only answers for a
+    running domain. This has to work for the stopped ones too, since those are
+    listed as well.
 
     Args:
         VM_NAME (str): Name of the domain.
 
     Returns:
-        0 when it can be reached, 1 otherwise.'
+        0 when there is a console device, 1 otherwise.'
 
-    [[ -n $(virsh -c "$CONF" ttyconsole "$1" 2> /dev/null) ]]
+    virsh -c "$CONF" dumpxml "$1" 2> /dev/null | grep -q "<console type='pty'"
+}
+
+state_of() {
+    : 'Give the state of a VM as a single word.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        "running", "shutoff" or whatever else libvirt reports, on the standard
+    output.'
+
+    local STATE_VALUE
+    STATE_VALUE="$(virsh -c "$CONF" domstate "$1" 2> /dev/null)"
+    printf '%s' "${STATE_VALUE// /}"
 }
 
 ip_of() {
@@ -75,39 +116,86 @@ ip_of() {
 
     Returns:
         The IP, on the standard output. Empty when there is no lease, which is the
-    case right after booting and for VMs on another network.'
+    case for a stopped VM, right after booting, and for VMs on another network.'
 
-    local mac
-    mac=$(virsh -c "$CONF" domiflist "$1" 2>/dev/null | awk 'NR>2 && NF {print $5; exit}')
-    [[ -n $mac ]] || return 0
+    local MAC_VALUE
+    MAC_VALUE=$(virsh -c "$CONF" domiflist "$1" 2>/dev/null | awk 'NR>2 && NF {print $5; exit}')
+    [[ -n $MAC_VALUE ]] || return 0
     virsh -c "$CONF" net-dhcp-leases default 2>/dev/null \
-        | awk -v m="$mac" '$0 ~ m {print $5}' | cut -d/ -f1
+        | awk -v m="$MAC_VALUE" '$0 ~ m {print $5}' | cut -d/ -f1
 }
+
+ensure_running() {
+    : 'Start a VM if it is not running, and wait for its console to exist.
+
+    Starting is not enough to connect: the pty comes up a moment later, and
+    attaching before it does gets you an error instead of a console.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        0 when there is a console to attach to, 1 otherwise.'
+
+    local VM_NAME="$1"
+    local WAITED_FOR=0
+
+    if [[ "$(state_of "$VM_NAME")" == "running" ]]; then
+        return 0
+    fi
+
+    echo "Starting $VM_NAME..."
+    virsh -c "$CONF" start "$VM_NAME" > /dev/null || return 1
+
+    while (( WAITED_FOR < START_TIMEOUT )); do
+        [[ -n $(virsh -c "$CONF" ttyconsole "$VM_NAME" 2> /dev/null) ]] && return 0
+        sleep 1
+        (( WAITED_FOR++ ))
+    done
+
+    echo "Gave up waiting ${START_TIMEOUT}s for the console of $VM_NAME." >&2
+    return 1
+}
+
+# --- Pick a VM ---------------------------------------------------------------
 
 vm="${1:-}"
 if [[ -z $vm ]]; then
     vms=()
-    while read -r n; do [[ -n $n ]] && reachable "$n" && vms+=("$n"); done \
-        < <(virsh -c "$CONF" list --name 2>/dev/null | sort)
+    labels=()
+    while read -r n; do
+        [[ -n $n ]] || continue
+        has_console "$n" || continue
+        st="$(state_of "$n")"
+        vms+=("$n")
+        labels+=("$(printf '%-48s %-18s [%s]' "$n" "$(ip_of "$n")" "$st")")
+    done < <(virsh -c "$CONF" list --all --name 2>/dev/null | sort)
+
     if (( ${#vms[@]} == 0 )); then
-        echo "No running VM with a console available."
+        echo "No VM with a console available."
         exit 1
     fi
-    if (( ${#vms[@]} == 1 )); then
-        vm="${vms[0]}"                       # only one: no point asking
-    else
-        echo "Running VMs with a console available:"
-        for i in "${!vms[@]}"; do
-            printf "  %2d) %-48s %s\n" $((i+1)) "${vms[$i]}" "$(ip_of "${vms[$i]}")"
-        done
-        read -rp "number: " n
-        [[ $n =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#vms[@]} )) || { echo "Invalid choice."; exit 1; }
-        vm="${vms[$((n-1))]}"
-    fi
+
+    echo "VMs with a console available:"
+    for i in "${!vms[@]}"; do
+        printf "  %2d) %s\n" $((i+1)) "${labels[$i]}"
+    done
+    read -rp "Number to (run and) connect or 0/quit: " n
+
+    # Leaving without picking anything is a normal way out, not a mistake.
+    case "$n" in
+        0|quit) exit 0 ;;
+    esac
+    [[ $n =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#vms[@]} )) || { echo "Invalid choice."; exit 1; }
+    vm="${vms[$((n-1))]}"
 else
     virsh -c "$CONF" domstate "$vm" &>/dev/null || { echo "VM '$vm' does not exist."; exit 1; }
-    reachable "$vm" || { echo "VM '$vm' is not running or has no pty console."; exit 1; }
+    has_console "$vm" || { echo "VM '$vm' has no serial console in its domain XML."; exit 1; }
 fi
+
+# --- Connect -----------------------------------------------------------------
+
+ensure_running "$vm" || exit 1
 
 ip=$(ip_of "$vm")
 trap restore_title EXIT INT TERM

@@ -2,8 +2,8 @@
 
 Opens the **serial console** of a libvirt/KVM virtual machine and puts the name of
 that machine on the **terminal tab title**, so you can tell your terminals apart.
-With no argument it lists the machines you can actually connect to and asks which
-one you want.
+With no argument it lists what you can connect to — running or not — and **starts
+the one you pick** if it is switched off.
 
 **IMPORTANT:** My life, my work and my passion is free software. Corrections, tweaks and improvements are very welcome (**pull requests** 😉)! Please consider giving us a ⭐, fork, support this project or even visit our professional profile (see [About](#about)). **Thanks!** 🤗
 
@@ -17,6 +17,7 @@ one you want.
    * [On the host](#on-the-host)
    * [On the guest](#on-the-guest)
 - [Installation](#installation)
+- [Configuration](#configuration)
 - [Usage](#usage)
 - [Why a serial console and not SSH](#why-a-serial-console-and-not-ssh)
 - [Troubleshooting](#troubleshooting)
@@ -44,12 +45,20 @@ So `vcon` fills the title in itself, and puts it back when you leave.
 
 ## How it works
 
-1. It lists the machines that are **running and have a console**, with the IP each
-   one got from the DHCP of the `default` network;
-2. You pick one — or it goes straight in, when there is only one;
-3. It sets the tab title to `(console) VM_NAME IP`;
-4. It hands over to `virsh console`;
-5. On exit, the original title comes back.
+1. It lists every machine that has a **console device in its domain XML**,
+   marked `[running]` or `[shutoff]`, with the IP each running one got from the
+   DHCP of the `default` network;
+2. You pick one;
+3. If it is switched off, it is **started**, and the script waits for the console
+   to come up — the pty appears a moment after the machine does, and attaching
+   before it exists gets you an error instead of a console;
+4. It sets the tab title to `(console) VM_NAME IP`;
+5. It hands over to `virsh console`;
+6. On exit, the original title comes back.
+
+The listing reads the domain XML rather than asking `virsh ttyconsole`, which
+only answers for a machine that is already running — and the stopped ones are
+exactly what this needs to show.
 
 The title is set through the D-Bus interface of Konsole when there is one, and
 through the OSC escape sequences otherwise, so other terminals are covered too.
@@ -121,19 +130,55 @@ case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;;
 
 ---
 
+## Configuration
+
+**Optional.** The defaults are what a local libvirt wants, and `vcon` runs with no
+configuration at all. Copy the model only when yours differs:
+
+```sh
+cp configs/config_model.bash configs/config.bash
+```
+
+| Parameter | Purpose |
+|---|---|
+| `LIBVIRT_URI` | Which libvirt to talk to. Default `qemu:///system` |
+| `LIBVIRT_AUTH_FILE` | Where libvirt should look for credentials, when the connection asks for them |
+| `START_TIMEOUT` | Seconds to wait for the console of a machine that was just started. Default `90` |
+
+A remote host is a matter of the URI:
+
+```sh
+LIBVIRT_URI='qemu+ssh://user@host/system'
+```
+
+**NOTE:** Credentials are libvirt's business, not this script's. `LIBVIRT_AUTH_FILE`
+points at the file libvirt already knows how to read — user name and password per
+service — instead of a scheme of our own. An SSH connection does not use it at
+all: that one authenticates the way SSH always does, with a key and an entry in
+`~/.ssh/config`.
+
+**NOTE:** `configs/config.bash` is ignored by git, so the addresses of your
+machine never end up in a commit.
+
+---
+
 ## Usage
 
 ```sh
 vcon                       # lists what you can connect to and asks
-vcon my-vm-name            # goes straight to that one
+vcon my-vm-name            # goes straight to that one, starting it if needed
 ```
 
 ```
-Running VMs with a console available:
-   1) CentOS_7.X_AMD64_ANEEL                   192.168.122.59
-   2) CentOS_7.X_AMD64_LBRAD                   192.168.122.240
-number:
+VMs with a console available:
+   1) CentOS_7.X_AMD64_ANEEL                   192.168.122.59     [running]
+   2) CentOS_7.X_AMD64_LB                                         [shutoff]
+   3) CentOS_7.X_AMD64_LBRAD                   192.168.122.240    [running]
+Number to (run and) connect or 0/quit:
 ```
+
+Picking a `[shutoff]` one starts it and waits for its console. `0` or `quit`
+leaves without picking anything.
 
 **To leave the console, press `Ctrl + ]`.** Without it you stay in there.
 
@@ -171,16 +216,21 @@ banner may simply have been printed before you connected.
 
 ### My VM is not listed
 
-Only machines that are running **and** have a console device are listed. Check
-with:
+Being switched off is not a reason — those are listed too. What is required is a
+console device in the domain XML:
 
 ```sh
-virsh -c qemu:///system list --all          # is it running?
-virsh -c qemu:///system ttyconsole MY_VM    # empty means no console to connect to
+virsh -c qemu:///system dumpxml MY_VM | grep console
 ```
 
-An empty `ttyconsole` on a running machine means the domain XML has no
-`<console type='pty'>`. Add one with `virsh edit`.
+Nothing there means the machine has no serial console. Add one with
+`virsh edit`:
+
+```xml
+<console type='pty'>
+  <target type='serial' port='0'/>
+</console>
+```
 
 ### The tab title does not change
 
@@ -202,3 +252,5 @@ vcon 🄯 BSD-3-Clause
 Eduardo Lúcio Amorim Costa  
 Brazil-DF  
 https://www.linkedin.com/in/eduardo-software-livre/
+
+![Brazil](./images/brazil.png)
