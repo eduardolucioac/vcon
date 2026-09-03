@@ -18,6 +18,9 @@ the one you pick** if it is switched off.
    * [On the guest](#on-the-guest)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Remote hosts and how they authenticate](#remote-hosts-and-how-they-authenticate)
+   * [The one that catches people out](#the-one-that-catches-people-out)
+   * [What the IP column means on a remote host](#what-the-ip-column-means-on-a-remote-host)
 - [Usage](#usage)
 - [Why a serial console and not SSH](#why-a-serial-console-and-not-ssh)
 - [Troubleshooting](#troubleshooting)
@@ -142,7 +145,7 @@ cp configs/config_model.bash configs/config.bash
 | Parameter | Purpose |
 |---|---|
 | `LIBVIRT_URI` | Which libvirt to talk to. Default `qemu:///system` |
-| `LIBVIRT_AUTH_FILE` | Where libvirt should look for credentials, when the connection asks for them |
+| `LIBVIRT_AUTH_FILE` | Where libvirt should look for credentials, for the connections that ask for them |
 | `START_TIMEOUT` | Seconds to wait for the console of a machine that was just started. Default `90` |
 
 A remote host is a matter of the URI:
@@ -151,14 +154,75 @@ A remote host is a matter of the URI:
 LIBVIRT_URI='qemu+ssh://user@host/system'
 ```
 
-**NOTE:** Credentials are libvirt's business, not this script's. `LIBVIRT_AUTH_FILE`
-points at the file libvirt already knows how to read — user name and password per
-service — instead of a scheme of our own. An SSH connection does not use it at
-all: that one authenticates the way SSH always does, with a key and an entry in
-`~/.ssh/config`.
-
 **NOTE:** `configs/config.bash` is ignored by git, so the addresses of your
 machine never end up in a commit.
+
+---
+
+## Remote hosts and how they authenticate
+
+There is no single "libvirt login". **The scheme of the URI picks both where to
+connect and how that connection is authenticated**, and the mechanisms have
+nothing to do with each other:
+
+| URI | Authenticated by | User name and password? |
+|---|---|---|
+| `qemu:///system` | **polkit**, on the uid of the caller | No — being in the `libvirt` group is what grants it |
+| `qemu:///session` | Nothing to check, they are your own VMs | No |
+| `qemu+ssh://user@host/system` | **SSH itself** — a key, or the password SSH asks for | SSH's, not libvirt's |
+| `qemu+libssh2://user@host/system` | SSH, through **libvirt's auth callback** | Yes, and it can come from a file |
+| `qemu+libssh://user@host/system` | The same, with libssh | Yes |
+| `qemu+tcp://host/system` | **SASL** | Yes — libvirt's own, from `saslpasswd2` |
+| `qemu+tls://host/system` | x509 certificates, plus SASL when the server asks | With SASL, yes |
+
+Where credentials are involved, libvirt reads them from an auth file of its own:
+
+```ini
+[credentials-mine]
+authname=my_user      # for SASL
+username=my_user      # for SSH and the ESX family
+password=my_password
+
+[auth-libvirt-my.host.name]
+credentials=mine
+```
+
+It is looked for in this order: `LIBVIRT_AUTH_FILE`, then the `authfile=`
+parameter of the URI, then `$XDG_CONFIG_HOME/libvirt/auth.conf`, then
+`/etc/libvirt/auth.conf`.
+
+### The one that catches people out
+
+**A password in a file never reaches `qemu+ssh://`.** That transport runs the
+`ssh` binary, which reads a password from the terminal, and libvirt has no way of
+handing one to it. The auth file only reaches SSH through `qemu+libssh2://` or
+`qemu+libssh://`, which speak the protocol in process.
+
+For `qemu+ssh://` there are two clean answers, and both are better than a stored
+password:
+
+```sh
+ssh-copy-id user@host          # a key: nothing is asked, nothing is stored
+```
+
+```
+# ~/.ssh/config -- or, if you must use a password, ask once and reuse it
+Host my-kvm-host
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 10m
+```
+
+**This matters more than it looks.** Building the list opens a connection per
+question — four per machine. Left to prompt, that is four passwords per VM just
+to draw a menu. A key asks nothing; `ControlMaster` asks once.
+
+### What the IP column means on a remote host
+
+The IP comes from the DHCP leases of the **remote** libvirt, so it is the address
+the guest has over there. It may well not be reachable from where you are running
+`vcon`. It is shown to tell the machines apart, and the console does not go
+through it — that one is tunnelled over the libvirt connection itself.
 
 ---
 
