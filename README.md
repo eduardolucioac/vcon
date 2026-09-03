@@ -1,5 +1,7 @@
 # vcon
 
+![vcon](./images/vcon.png)
+
 Opens the **serial console** of a libvirt/KVM virtual machine and puts the name of
 that machine on the **terminal tab title**, so you can tell your terminals apart.
 With no argument it lists what you can connect to — running or not — and **starts
