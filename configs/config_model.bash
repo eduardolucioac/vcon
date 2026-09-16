@@ -91,12 +91,20 @@ IP_TIMEOUT=60
 # behind a "t" for when the network is what broke.
 
 # User name for the SSH connections, for the machines that have nothing said about
-# them below. Left empty, you are ASKED before the connection is made -- the local
-# user name is offered as a suggestion, never applied on its own. A guest whose
-# account is "root" would make that suggestion plainly wrong, and a wrong guess
-# made confidently is worse than a question.
+# them below.
+#
+# Leaving it empty is fine, and is what most people should do: nothing is guessed,
+# and you are asked at most ONCE per machine -- the answer is kept and used from
+# then on. It is not asked at all when ssh already gets into that host on its own,
+# with a key and whatever "~/.ssh/config" says.
+#
 # (Optional, Default empty)
 SSH_USER=''
+
+# How long to wait, in seconds, while finding out whether ssh gets in on its own.
+# That check runs before asking anything, and only when nothing else named a user.
+# (Optional, Default 5)
+SSH_PROBE_TIMEOUT=5
 
 # User name per machine, keyed by the name of the domain. This is what a lab of
 # mixed guests wants: one of them answers to "root", another to your own name,
@@ -120,6 +128,12 @@ declare -A SSH_USERS=()
 #
 # Leaving SSH_USER and SSH_USERS empty and answering the question with an empty
 # line hands the choice entirely to ssh, "User" lines included.
+#
+# WHAT IS REMEMBERED: the answer to that question is kept per machine, in
+# "$XDG_STATE_HOME/vcon/ssh-users" ("~/.local/state/vcon/ssh-users" by default).
+# It lives there and not here because it is written by the program, not by you --
+# and this folder is a git working tree. To change one, connect once with
+# "vcon -u OTHER_USER NAME"; to forget them all, delete that file.
 
 # Port, when it is not 22.
 # (Optional, Default empty)

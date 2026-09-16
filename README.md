@@ -186,28 +186,50 @@ cp configs/config_model.bash configs/config.bash
 | `LIBVIRT_AUTH_FILE` | Where libvirt should look for credentials, for the connections that ask for them |
 | `START_TIMEOUT` | Seconds to wait for the console of a machine that was just started. Default `90` |
 | `IP_TIMEOUT` | Seconds to wait for a just-started machine to have an address. Default `60` |
-| `SSH_USER` | User name for SSH. Empty means you are **asked** before connecting |
+| `SSH_USER` | User name for SSH, for machines `SSH_USERS` says nothing about |
 | `SSH_USERS` | User name per machine, keyed by domain name |
+| `SSH_PROBE_TIMEOUT` | Seconds to spend finding out whether `ssh` gets in on its own. Default `5` |
 | `SSH_PORT` | Port for SSH, when it is not 22 |
 | `SSH_OPTS` | Anything else to hand to `ssh`, as an array |
 
 ### Which user SSH connects as
 
-**Nothing is guessed.** In order: what `SSH_USERS` says for that machine, then
-`SSH_USER`, then a question:
+**Nothing is guessed, and nothing is asked twice.** In order:
+
+| | Where it comes from |
+|---|---|
+| 1 | `-u USER` on the command line — and it replaces what was kept |
+| 2 | `SSH_USERS` in the configuration, for that machine |
+| 3 | `SSH_USER` in the configuration, for all of them |
+| 4 | **What you answered last time for that machine** |
+| 5 | Nothing at all, when `ssh` already gets in by itself |
+| 6 | A question, whose answer is kept |
+
+Most people need none of the configuration. The first time you connect to a
+machine:
 
 ```
-User for SSH on CentOS_7.X_AMD64_LBRAD [eduardolac]: 
+User for SSH on CentOS_7.X_AMD64_LBRAD: root
 ```
 
-The name in brackets is what `ssh` itself would use for that host, `~/.ssh/config`
-included. Accepting it is one keystroke, but it is a **suggestion** — a guest
-whose account is `root` would make it plainly wrong, and a wrong guess made
-confidently is worse than a question.
+and from then on it is not asked again.
 
-An empty answer hands the choice to `ssh`, `User` lines and all.
+**It is not asked at all when `ssh` already gets into that host on its own** — a
+key, and whatever `~/.ssh/config` says about it. That is checked with a
+`BatchMode` connection, which cannot prompt for anything: getting through means
+the setup is already complete, and a question would only be noise on top of it.
 
-For a lab of mixed guests, name them once:
+What was answered is kept per machine, in
+`$XDG_STATE_HOME/vcon/ssh-users` — `~/.local/state/vcon/ssh-users` by default. It
+is written there and not in `configs/` because the program writes it, not you,
+and `configs/` lives in a git working tree.
+
+```sh
+vcon -u other_user my-vm    # connect as someone else, and keep that instead
+rm ~/.local/state/vcon/ssh-users    # forget all of them
+```
+
+For a lab where you would rather name them up front than answer once each:
 
 ```sh
 declare -A SSH_USERS=(
@@ -315,6 +337,7 @@ through it — that one is tunnelled over the libvirt connection itself.
 vcon                       # lists everything and asks
 vcon my-vm-name            # SSH, starting it if needed
 vcon -t my-vm-name         # serial console instead
+vcon -u root my-vm-name    # connect as someone else, and keep that
 ```
 
 ```

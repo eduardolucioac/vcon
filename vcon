@@ -31,8 +31,15 @@ START_TIMEOUT="${START_TIMEOUT:-90}"
 IP_TIMEOUT="${IP_TIMEOUT:-60}"
 SSH_USER="${SSH_USER:-}"
 SSH_PORT="${SSH_PORT:-}"
+SSH_PROBE_TIMEOUT="${SSH_PROBE_TIMEOUT:-5}"
 [ -n "${SSH_OPTS+x}" ] || SSH_OPTS=()
 declare -A SSH_USERS 2> /dev/null || true
+
+# Where the user name last given for a machine is kept. Not in the project: that
+# is a git working tree, and this is state of the person running it, not of the
+# code.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/vcon"
+STATE_USERS="$STATE_DIR/ssh-users"
 
 # Credentials are libvirt's business, not this script's. Pointing at its auth file
 # is all that is needed; inventing a way to carry a password around here would be
@@ -270,13 +277,77 @@ ensure_running() {
     return 1
 }
 
-f_ssh_user_for() {
-    : 'Work out which user to connect as, and ask when nothing says.
+f_remembered_user() {
+    : 'Give back the user name last used for a machine.
 
-    Guessing is what this avoids. Falling back to the local user name is what ssh
-    does on its own, and on a guest whose account is "root" that is simply the
-    wrong answer given confidently -- so it is offered as a suggestion to accept,
-    never applied behind your back.
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        The user name on the standard output, empty when there is none.'
+
+    [ -f "$STATE_USERS" ] || return 0
+
+    local NAME_NOW USER_NOW
+    while IFS=$'\037' read -r NAME_NOW USER_NOW; do
+        if [ "$NAME_NOW" == "$1" ]; then
+            printf '%s' "$USER_NOW"
+            return 0
+        fi
+    done < "$STATE_USERS"
+}
+
+f_remember_user() {
+    : 'Keep the user name used for a machine, so it is not asked again.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+        USER_VALUE (str): User name to keep.'
+
+    [ -n "$2" ] || return 0
+
+    mkdir -p "$STATE_DIR" 2> /dev/null || return 0
+
+    local TMP_FILE
+    TMP_FILE="$(mktemp "${STATE_USERS}.XXXXXX")" || return 0
+
+    # Everything but this machine is carried over, then its line is written.
+    if [ -f "$STATE_USERS" ]; then
+        awk -F'\037' -v n="$1" '$1 != n' "$STATE_USERS" > "$TMP_FILE"
+    fi
+    printf '%s\037%s\n' "$1" "$2" >> "$TMP_FILE"
+
+    chmod 600 "$TMP_FILE" 2> /dev/null
+    mv -f "$TMP_FILE" "$STATE_USERS" 2> /dev/null || rm -f "$TMP_FILE"
+}
+
+f_ssh_connects_alone() {
+    : 'Tell whether ssh already gets in on its own.
+
+    "BatchMode=yes" turns off every prompt, so getting through means the keys and
+    "~/.ssh/config" already cover this host and there is nothing to ask about.
+
+    Args:
+        IP_VALUE (str): Address to try.
+
+    Returns:
+        0 when it got in asking nothing, 1 otherwise.'
+
+    timeout "$((SSH_PROBE_TIMEOUT + 3))" ssh -o BatchMode=yes \
+        -o ConnectTimeout="$SSH_PROBE_TIMEOUT" \
+        ${SSH_PORT:+-p "$SSH_PORT"} \
+        ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} \
+        "$1" true > /dev/null 2>&1
+}
+
+f_ssh_user_for() {
+    : 'Work out which user to connect as.
+
+    Guessing is what this avoids, and so is asking twice for the same answer. In
+    order: what the command line said, what the configuration names for this
+    machine, what it names for all of them, what was answered last time, and --
+    only when none of those know and ssh cannot get in by itself -- a question,
+    whose answer is kept for next time.
 
     Args:
         VM_NAME (str): Name of the domain.
@@ -288,28 +359,41 @@ f_ssh_user_for() {
 
     local VM_NAME="$1"
     local IP_VALUE="$2"
-    local HINT_VALUE=""
     local ANSWER_VALUE=""
 
-    # Named for this machine: nothing to ask.
+    # Asked for on the command line: it wins, and replaces what was kept.
+    if [ -n "${SSH_USER_ARG:-}" ]; then
+        f_remember_user "$VM_NAME" "$SSH_USER_ARG"
+        printf '%s' "$SSH_USER_ARG"
+        return 0
+    fi
+
+    # Named in the configuration, for this machine or for all of them.
     if [ -n "${SSH_USERS[$VM_NAME]:-}" ]; then
         printf '%s' "${SSH_USERS[$VM_NAME]}"
         return 0
     fi
-
-    # Named for all of them: nothing to ask either.
     if [ -n "$SSH_USER" ]; then
         printf '%s' "$SSH_USER"
         return 0
     fi
 
-    # Nothing in the configuration, so ask. The hint is what ssh itself would use
-    # for this host, "~/.ssh/config" included, so an empty answer keeps its normal
-    # behaviour rather than overriding it.
-    HINT_VALUE="$(ssh -G "$IP_VALUE" 2> /dev/null | awk '/^user /{print $2; exit}')"
+    # Answered here before.
+    ANSWER_VALUE="$(f_remembered_user "$VM_NAME")"
+    if [ -n "$ANSWER_VALUE" ]; then
+        printf '%s' "$ANSWER_VALUE"
+        return 0
+    fi
 
-    read -r -p "User for SSH on ${VM_NAME}${HINT_VALUE:+ [$HINT_VALUE]}: " \
-        ANSWER_VALUE < /dev/tty
+    # Nothing knows, so before asking: ssh may already have everything it needs
+    # for this host -- a key, a "User" line -- in which case a question would be
+    # noise, and answering it would override a setup that already works.
+    if f_ssh_connects_alone "$IP_VALUE"; then
+        return 0
+    fi
+
+    read -r -p "User for SSH on ${VM_NAME}: " ANSWER_VALUE < /dev/tty
+    [ -n "$ANSWER_VALUE" ] && f_remember_user "$VM_NAME" "$ANSWER_VALUE"
 
     printf '%s' "$ANSWER_VALUE"
 }
@@ -352,11 +436,13 @@ f_wait_for_ip() {
 # console answers a different need -- it works with no network at all -- so it is
 # there for when the network is what broke, behind a "t".
 USE_TTY=0
+SSH_USER_ARG=""
 
 vm=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -t|--tty) USE_TTY=1 ;;
+        -u|--user) shift; SSH_USER_ARG="${1:-}" ;;
         -*) echo "Unknown option '$1'." >&2; exit 1 ;;
         *) vm="$1" ;;
     esac
