@@ -2,10 +2,9 @@
 
 ![vcon](./images/vcon.png)
 
-Opens the **serial console** of a libvirt/KVM virtual machine and puts the name of
-that machine on the **terminal tab title**, so you can tell your terminals apart.
-With no argument it lists what you can connect to — running or not — and **starts
-the one you pick** if it is switched off.
+Lists your libvirt/KVM virtual machines — running or not — and connects to the one
+you pick, **starting it first** if it is switched off. By **SSH** for everyday
+work, or by **serial console** when the network is what broke.
 
 **IMPORTANT:** My life, my work and my passion is free software. Corrections, tweaks and improvements are very welcome (**pull requests** 😉)! Please consider giving us a ⭐, fork, support this project or even visit our professional profile (see [About](#about)). **Thanks!** 🤗
 
@@ -17,15 +16,18 @@ the one you pick** if it is switched off.
 - [How it works](#how-it-works)
 - [Requirements](#requirements)
    * [On the host](#on-the-host)
-   * [On the guest](#on-the-guest)
+   * [On the guest, for SSH](#on-the-guest-for-ssh)
+   * [On the guest, for the serial console](#on-the-guest-for-the-serial-console)
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Remote hosts and how they authenticate](#remote-hosts-and-how-they-authenticate)
    * [The one that catches people out](#the-one-that-catches-people-out)
    * [What the IP column means on a remote host](#what-the-ip-column-means-on-a-remote-host)
 - [Usage](#usage)
-- [Why a serial console and not SSH](#why-a-serial-console-and-not-ssh)
+- [When the serial console earns its keep](#when-the-serial-console-earns-its-keep)
 - [Troubleshooting](#troubleshooting)
+   * [SSH says "Connection refused" or asks for a password forever](#ssh-says-connection-refused-or-asks-for-a-password-forever)
+   * [There is no address in the list](#there-is-no-address-in-the-list)
    * [The console is blank](#the-console-is-blank)
    * [My VM is not listed](#my-vm-is-not-listed)
    * [The tab title does not change](#the-tab-title-does-not-change)
@@ -36,8 +38,14 @@ the one you pick** if it is switched off.
 
 ## Why
 
-`virsh console` works, but it tells you nothing about where you are. Every tab
-reads `~ : virsh`, and with three of them open you are guessing.
+Two things, really.
+
+Connecting to a VM means looking up its address, remembering whether it is even
+running, starting it if it is not, and only then typing `ssh`. That is four steps
+to do one thing, and it gets worse with every machine you add.
+
+And `virsh console` tells you nothing about where you are. Every tab reads
+`~ : virsh`, and with three of them open you are guessing.
 
 Konsole does solve this for SSH — it recognizes the command, reads its arguments
 and switches to the "remote tab title format", which is why an SSH tab shows
@@ -50,19 +58,25 @@ So `vcon` fills the title in itself, and puts it back when you leave.
 
 ## How it works
 
-1. It lists every machine that has a **console device in its domain XML**,
-   marked `[running]` or `[shutoff]`, with the IP each running one got from the
-   DHCP of the `default` network. That whole survey is **two calls to virsh**,
-   however many machines there are;
-2. You pick one;
-3. If it is switched off, it is **started**, and the script waits for the console
-   to come up — the pty appears a moment after the machine does, and attaching
-   before it exists gets you an error instead of a console;
-4. It sets the tab title to `(console) VM_NAME IP`;
-5. It hands over to `virsh console`;
-6. On exit, the original title comes back.
+1. It lists every machine, marked `[running]` or `[shutoff]`, with the address of
+   each one that has one. That whole survey is **two calls to virsh**, however
+   many machines there are;
+2. You pick one — a plain number for **SSH**, a `t` in front for the **serial
+   console**;
+3. If it is switched off, it is **started**, and the script waits: for an address
+   when it is going to SSH, for the console pty when it is not. Both appear a
+   moment after the machine does, and connecting before they exist gets you an
+   error rather than a session;
+4. It sets the tab title, and hands over to `ssh` or to `virsh console`;
+5. On exit, the original title comes back.
 
-The listing reads the domain XML rather than asking `virsh ttyconsole`, which
+**Finding the address** is done with every source libvirt has, in turn: the DHCP
+leases, the guest agent, the ARP table of the host. The leases alone are not
+enough — that table is emptied when the daemon restarts, while the guest carries
+on with the address it already holds, and a guest with a static address was never
+in it at all.
+
+The listing reads the **domain XML** rather than asking `virsh ttyconsole`, which
 only answers for a machine that is already running — and the stopped ones are
 exactly what this needs to show.
 
@@ -75,15 +89,35 @@ through the OSC escape sequences otherwise, so other terminals are covered too.
 
 ### On the host
 
-- `libvirt` (`virsh`), obviously;
-- `qdbus6` for the tab title on Konsole. Without it the script still runs, it just
-  cannot rename the tab.
+- **`libvirt`** (`virsh`). Everything goes through it;
+- **`ssh`**, from `openssh` — the client only. Without it, only the serial console
+  works;
+- **`qdbus6`**, from `qt6-tools`, for the tab title on Konsole. Without it the
+  script still runs, it just cannot rename the tab.
 
-### On the guest
+```sh
+sudo pacman -S --needed libvirt openssh qt6-tools     # Arch and derivatives
+sudo apt install libvirt-clients openssh-client qt6-tools-dev-tools   # Debian based
+```
 
-**This is the part that is easy to miss.** The `<console type='pty'>` device comes
-by default in the domain XML, so `virsh console` connects — but it shows a **blank
-screen** until the guest speaks on that serial port and runs a `getty` on it.
+### On the guest, for SSH
+
+The usual: an **`sshd` running**, a **working network**, and credentials — a key
+in `~/.ssh/authorized_keys` being the one that asks nothing.
+
+This is the path that needs the guest to be reachable. When it is not, the other
+one still is.
+
+### On the guest, for the serial console
+
+**This is the part that is easy to miss, and the reason the serial console is
+worth setting up before you need it.** It works with **no network at all** — no
+address, no `sshd`, no firewall rule — which is exactly the situation where you
+want it.
+
+The `<console type='pty'>` device comes by default in the domain XML, so
+`virsh console` connects. But it shows a **blank screen** until the guest speaks
+on that serial port and runs a `getty` on it.
 
 On a systemd guest (Debian, RHEL, CentOS, Ubuntu...):
 
@@ -98,7 +132,7 @@ Then reboot the guest.
 `console=` wins for `/dev/console`, but declaring both sends the boot messages to
 both places — you gain the serial console without losing the graphical one.
 
-On a guest that is switched off, the same thing can be done offline with
+On a guest that is switched off, the same can be done offline with
 `virt-customize` from `libguestfs`, no boot needed:
 
 ```sh
@@ -150,6 +184,20 @@ cp configs/config_model.bash configs/config.bash
 | `LIBVIRT_URI` | Which libvirt to talk to. Default `qemu:///system` |
 | `LIBVIRT_AUTH_FILE` | Where libvirt should look for credentials, for the connections that ask for them |
 | `START_TIMEOUT` | Seconds to wait for the console of a machine that was just started. Default `90` |
+| `IP_TIMEOUT` | Seconds to wait for a just-started machine to have an address. Default `60` |
+| `SSH_USER` | User name for SSH. Empty means your own, as `ssh` always does |
+| `SSH_PORT` | Port for SSH, when it is not 22 |
+| `SSH_OPTS` | Anything else to hand to `ssh`, as an array |
+
+**TIP:** For anything per machine — a different user on one of them, a jump host,
+a particular key — `~/.ssh/config` is the place, and it is read here as it is
+everywhere else:
+
+```
+Host 192.168.122.*
+    User root
+    IdentityFile ~/.ssh/id_lab
+```
 
 A remote host is a matter of the URI:
 
@@ -237,20 +285,38 @@ through it — that one is tunnelled over the libvirt connection itself.
 ## Usage
 
 ```sh
-vcon                       # lists what you can connect to and asks
-vcon my-vm-name            # goes straight to that one, starting it if needed
+vcon                       # lists everything and asks
+vcon my-vm-name            # SSH, starting it if needed
+vcon -t my-vm-name         # serial console instead
 ```
 
 ```
-VMs with a console available:
+VMs:
    1) CentOS_7.X_AMD64_ANEEL                   192.168.122.59     [running]
    2) CentOS_7.X_AMD64_LB                                         [shutoff]
    3) CentOS_7.X_AMD64_LBRAD                   192.168.122.240    [running]
-Number to (run and) connect or 0/quit:
+Number to (run and) connect by SSH, t+number for serial console, or 0/quit:
 ```
 
-Picking a `[shutoff]` one starts it and waits for its console. `0` or `quit`
-leaves without picking anything.
+| Answer | What it does |
+|---|---|
+| `3` | **SSH** to machine 3 |
+| `t3` | **Serial console** of machine 3 |
+| `0` or `quit` | Leave without picking anything |
+
+Picking a `[shutoff]` one starts it first, and waits — for an address when it is
+going to SSH, for the console otherwise.
+
+**SSH is the default because it is a terminal citizen**: scrollback, resizing,
+your keys, `scp`, port forwarding, and Konsole naming the tab by itself. The
+serial console answers a different need — it works with the network down — so it
+lives behind a `t`.
+
+**To leave a serial console, press `Ctrl + ]`.** SSH exits the way it always
+does.
+
+**TIP:** A serial console often comes up empty. The `getty` prints its banner
+once and you arrived after it — press **Enter** to get the prompt.
 
 **To leave the console, press `Ctrl + ]`.** Without it you stay in there.
 
@@ -260,10 +326,10 @@ prompt.
 
 ---
 
-## Why a serial console and not SSH
+## When the serial console earns its keep
 
-SSH is nicer for everyday work. The serial console is what you have left when SSH
-is not an option:
+SSH is the better seat for everyday work, which is why a plain number goes there.
+The serial console answers a question SSH cannot:
 
 | | Needs the network | Needs an agent in the guest | Works in an emergency |
 |---|---|---|---|
@@ -280,10 +346,30 @@ sharing, no agent, no X inside the guest.
 
 ## Troubleshooting
 
+### SSH says "Connection refused" or asks for a password forever
+
+That is between you and the guest, not something `vcon` is in the middle of:
+`sshd` has to be running there, the network has to be up, and your key has to be
+in `authorized_keys`. Try the same thing by hand — `ssh user@ip` — and you will
+get the same answer.
+
+**When the network is what is broken, use the serial console**: `t` in front of
+the number, or `-t` with the name. It needs none of that — see
+[On the guest, for the serial console](#on-the-guest-for-the-serial-console).
+
+### There is no address in the list
+
+The machine has not asked for one yet, has a static address libvirt never handed
+out and cannot see, or is on a network without the DHCP of libvirt. All three
+sources are tried — leases, guest agent, ARP table — so what is missing is
+usually the guest itself having spoken on the network at least once.
+
+SSH needs an address. The serial console does not.
+
 ### The console is blank
 
 The console device is there, but nothing in the guest is listening on it. See
-[On the guest](#on-the-guest). If you already did that, press **Enter** — the
+[On the guest, for the serial console](#on-the-guest-for-the-serial-console). If you already did that, press **Enter** — the
 banner may simply have been printed before you connected.
 
 ### My VM is not listed

@@ -28,6 +28,10 @@ CONFIG_MODEL="$VCON_DIR/configs/config_model.bash"
 
 CONF="${LIBVIRT_URI:-qemu:///system}"
 START_TIMEOUT="${START_TIMEOUT:-90}"
+IP_TIMEOUT="${IP_TIMEOUT:-60}"
+SSH_USER="${SSH_USER:-}"
+SSH_PORT="${SSH_PORT:-}"
+[ -n "${SSH_OPTS+x}" ] || SSH_OPTS=()
 
 # Credentials are libvirt's business, not this script's. Pointing at its auth file
 # is all that is needed; inventing a way to carry a password around here would be
@@ -94,19 +98,33 @@ has_console() {
 }
 
 ip_of() {
-    : 'Find the IP a VM was given by the DHCP of the default network.
+    : 'Find the address of a VM, trying every source libvirt has.
+
+    The DHCP leases alone are not enough: the table is emptied when the daemon
+    restarts, while the guest carries on with the address it already holds, and a
+    guest with a static address was never in it to begin with. The ARP table of
+    the host knows those, and the guest agent -- where one is installed -- knows
+    them best of all.
 
     Args:
         VM_NAME (str): Name of the domain.
 
     Returns:
-        The IP, on the standard output. Empty when there is no lease.'
+        The IP, on the standard output. Empty when no source has one, which is
+    the case for a stopped VM and for one that has not spoken on the network yet.'
 
-    local MAC_VALUE
-    MAC_VALUE=$(virsh -c "$CONF" domiflist "$1" 2>/dev/null | awk 'NR>2 && NF {print $5; exit}')
-    [[ -n $MAC_VALUE ]] || return 0
-    virsh -c "$CONF" net-dhcp-leases default 2>/dev/null \
-        | awk -v m="$MAC_VALUE" '$0 ~ m {print $5}' | cut -d/ -f1
+    local SOURCE_NOW IP_VALUE
+
+    for SOURCE_NOW in lease agent arp; do
+        IP_VALUE="$(virsh -c "$CONF" domifaddr "$1" --source "$SOURCE_NOW" 2> /dev/null \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+        if [ -n "$IP_VALUE" ]; then
+            printf '%s' "$IP_VALUE"
+            return 0
+        fi
+    done
+
+    return 0
 }
 
 state_of() {
@@ -141,8 +159,11 @@ survey_vms() {
     connection when it is fed through the standard input.
 
     Returns:
-        One line per VM with a console, on the standard output, as
-    "NAME<tab>STATE<tab>IP". IP is empty when there is no lease.'
+        One line per VM, on the standard output, as
+    "NAME\037STATE\037IP\037HAS_CONSOLE", separated by unit separators rather
+    than tabs: a tab is IFS whitespace to bash, so two in a row collapse into one
+    and an empty IP silently shifts every field after it. Every VM is listed --
+    SSH wants an address, not a console device.'
 
     local NAMES_VALUE BATCH_VALUE OUT_VALUE
 
@@ -155,6 +176,9 @@ survey_vms() {
     while IFS= read -r VM_NOW; do
         BATCH_VALUE+="echo VCONSEP${VM_NOW}VCONSEP"$'\n'
         BATCH_VALUE+="domstate ${VM_NOW}"$'\n'
+        BATCH_VALUE+="echo VCONADDR"$'\n'
+        BATCH_VALUE+="domifaddr ${VM_NOW} --source arp"$'\n'
+        BATCH_VALUE+="echo VCONXML"$'\n'
         BATCH_VALUE+="dumpxml ${VM_NOW}"$'\n'
     done <<< "$NAMES_VALUE"
 
@@ -178,23 +202,37 @@ survey_vms() {
         {
             if (match($0, /VCONSEP.*VCONSEP/)) {
                 name = substr($0, RSTART + 7, RLENGTH - 14)
+                section = "state"
                 next
             }
+            if ($0 ~ /VCONADDR/) { section = "addr"; next }
+            if ($0 ~ /VCONXML/)  { section = "xml";  next }
         }
         name == "" { next }
         # "domstate" answers with one bare word, on its own line.
-        $0 ~ /^(running|shut off|paused|idle|in shutdown|crashed|pmsuspended)$/ {
+        section == "state" && $0 ~ /^(running|shut off|paused|idle|in shutdown|crashed|pmsuspended)$/ {
             state[name] = $0; gsub(/ /, "", state[name]); next
         }
-        /<console type=.pty./ { console[name] = 1 }
-        /<mac address=/ {
+        # "domifaddr --source arp" reads the ARP table of the host, which knows
+        # machines the lease table has forgotten -- after the daemon restarted,
+        # for instance, while the guest kept the address it already had.
+        section == "addr" && match($0, /[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) {
+            if (!(name in arp)) arp[name] = substr($0, RSTART, RLENGTH)
+        }
+        section == "xml" && /<console type=.pty./ { console[name] = 1 }
+        section == "xml" && /<mac address=/ {
             if (match($0, /([0-9a-f]{2}:){5}[0-9a-f]{2}/) && !(name in mac))
                 mac[name] = substr($0, RSTART, RLENGTH)
         }
+        # Every machine that answered "domstate" exists, console or not: SSH wants
+        # an address, not a console device.
         END {
-            for (n in console)
-                printf "%s\t%s\t%s\n", n, (n in state ? state[n] : "?"),
-                       (n in mac && mac[n] in lease ? lease[mac[n]] : "")
+            for (n in state) {
+                ip = (n in mac && mac[n] in lease) ? lease[mac[n]] : \
+                     ((n in arp) ? arp[n] : "")
+                printf "%s\037%s\037%s\037%s\n", n, state[n], ip,
+                       (n in console ? 1 : 0)
+            }
         }
     ' | LC_ALL=C sort
 }
@@ -231,49 +269,138 @@ ensure_running() {
     return 1
 }
 
+f_wait_for_ip() {
+    : 'Wait until a VM has an address, and give it back.
+
+    A machine that was just started has no lease yet: it has to boot far enough to
+    ask for one. Connecting before that fails with nothing useful to say, so this
+    waits, and gives up with a status rather than an empty string.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+
+    Returns:
+        The IP on the standard output, 0 when there is one. 1 when none turned up
+    before IP_TIMEOUT.'
+
+    local VM_NAME="$1"
+    local WAITED_FOR=0
+    local IP_VALUE=""
+
+    while (( WAITED_FOR < IP_TIMEOUT )); do
+        IP_VALUE="$(ip_of "$VM_NAME")"
+        if [ -n "$IP_VALUE" ]; then
+            printf '%s' "$IP_VALUE"
+            return 0
+        fi
+        sleep 1
+        (( WAITED_FOR++ ))
+    done
+
+    return 1
+}
+
 # --- Pick a VM ---------------------------------------------------------------
 
-vm="${1:-}"
+# SSH is the default because it is a terminal citizen: scrollback, resizing, your
+# keys, scp, port forwarding, and Konsole naming the tab by itself. The serial
+# console answers a different need -- it works with no network at all -- so it is
+# there for when the network is what broke, behind a "t".
+USE_TTY=0
+
+vm=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t|--tty) USE_TTY=1 ;;
+        -*) echo "Unknown option '$1'." >&2; exit 1 ;;
+        *) vm="$1" ;;
+    esac
+    shift
+done
+
 if [[ -z $vm ]]; then
-    vms=()
-    labels=()
-    while IFS=$'\t' read -r n st ip; do
+    vms=(); labels=(); consoles=()
+    while IFS=$'\037' read -r n st ip hascon; do
         [[ -n $n ]] || continue
         vms+=("$n")
+        consoles+=("$hascon")
         labels+=("$(printf '%-48s %-18s [%s]' "$n" "$ip" "$st")")
     done < <(survey_vms)
 
     if (( ${#vms[@]} == 0 )); then
-        echo "No VM with a console available."
+        echo "No VM found."
         exit 1
     fi
 
-    echo "VMs with a console available:"
+    echo "VMs:"
     for i in "${!vms[@]}"; do
         printf "  %2d) %s\n" $((i+1)) "${labels[$i]}"
     done
-    read -rp "Number to (run and) connect or 0/quit: " n
+    read -rp "Number to (run and) connect by SSH, t+number for serial console, or 0/quit: " n
 
     # Leaving without picking anything is a normal way out, not a mistake.
     case "$n" in
         0|quit) exit 0 ;;
     esac
+
+    # "t" in front asks for the serial console instead of SSH.
+    if [[ $n == t* || $n == T* ]]; then
+        USE_TTY=1
+        n="${n:1}"
+    fi
+
     [[ $n =~ ^[0-9]+$ ]] && (( n>=1 && n<=${#vms[@]} )) || { echo "Invalid choice."; exit 1; }
     vm="${vms[$((n-1))]}"
 else
     virsh -c "$CONF" domstate "$vm" &>/dev/null || { echo "VM '$vm' does not exist."; exit 1; }
-    has_console "$vm" || { echo "VM '$vm' has no serial console in its domain XML."; exit 1; }
 fi
 
 # --- Connect -----------------------------------------------------------------
 
+if [ ${USE_TTY} -eq 1 ]; then
+    has_console "$vm" || {
+        echo "VM '$vm' has no serial console in its domain XML, so there is"\
+" nothing to attach to." >&2
+        echo "Add one with \"virsh edit\", or connect by SSH instead." >&2
+        exit 1
+    }
+
+    ensure_running "$vm" || exit 1
+
+    ip=$(ip_of "$vm")
+    trap restore_title EXIT INT TERM
+    set_title "(console) ${vm}${ip:+ $ip}"
+    echo "Connecting to $vm${ip:+ ($ip)} by serial console -- exit with Ctrl + ]"
+    virsh -c "$CONF" console "$vm" --force
+    exit $?
+fi
+
+# --- SSH ---
+command -v ssh > /dev/null 2>&1 || {
+    echo "\"ssh\" was not found. Install an SSH client, or use the serial console"\
+" with \"t\" in front of the number." >&2
+    exit 1
+}
+
 ensure_running "$vm" || exit 1
 
-ip=$(ip_of "$vm")
+ip="$(f_wait_for_ip "$vm")" || {
+    echo "No address for $vm: the guest may still be booting, may have no network,"\
+" or may be on a network without the DHCP of libvirt." >&2
+    echo "The serial console needs none of that -- put a \"t\" in front of the"\
+" number, or use \"-t\"." >&2
+    exit 1
+}
+
+SSH_CMD=(ssh)
+[ -n "${SSH_PORT:-}" ] && SSH_CMD+=(-p "$SSH_PORT")
+SSH_CMD+=(${SSH_OPTS[@]+"${SSH_OPTS[@]}"})
+SSH_CMD+=("${SSH_USER:+$SSH_USER@}$ip")
+
 trap restore_title EXIT INT TERM
-set_title "(console) ${vm}${ip:+ $ip}"
-echo "Connecting to $vm${ip:+ ($ip)} -- exit with Ctrl + ]"
-virsh -c "$CONF" console "$vm" --force
+set_title "(ssh) ${vm} ${ip}"
+echo "Connecting to $vm ($ip) by SSH..."
+"${SSH_CMD[@]}"
 
 # vcon "inverted (c)" BSD-3-Clause
 # Eduardo Lucio Amorim Costa

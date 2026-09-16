@@ -79,6 +79,43 @@ LIBVIRT_AUTH_FILE=''
 # (Optional, Default 90)
 START_TIMEOUT=90
 
+# How long to wait, in seconds, for a VM that was just started to have an address.
+# It has to boot far enough to ask for one, which takes longer than the machine
+# itself takes to come up. Only used for SSH.
+# (Optional, Default 60)
+IP_TIMEOUT=60
+
+# --- SSH ---
+# SSH is what a plain number connects with, since it is a terminal citizen:
+# scrollback, resizing, your keys, scp, port forwarding. The serial console is
+# behind a "t" for when the network is what broke.
+
+# User name for the SSH connections. Left empty, ssh uses your own, the way it
+# always does.
+#
+# NOTE: For anything per machine -- a different user on one of them, a jump host,
+# a particular key -- "~/.ssh/config" is the place, and it is read here as it is
+# everywhere else:
+#
+#   Host 192.168.122.*
+#       User root
+#       IdentityFile ~/.ssh/id_lab
+#
+# (Optional, Default empty)
+SSH_USER=''
+
+# Port, when it is not 22.
+# (Optional, Default empty)
+SSH_PORT=''
+
+# Anything else to hand to ssh, as an array. An array and not a string, so that a
+# value with a space in it survives.
+#
+#   SSH_OPTS=(-o StrictHostKeyChecking=accept-new)
+#
+# (Optional, Default empty)
+SSH_OPTS=()
+
 # < -----------------------------------------
 
 # vcon "inverted (c)" BSD-3-Clause
