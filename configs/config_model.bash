@@ -90,19 +90,36 @@ IP_TIMEOUT=60
 # scrollback, resizing, your keys, scp, port forwarding. The serial console is
 # behind a "t" for when the network is what broke.
 
-# User name for the SSH connections. Left empty, ssh uses your own, the way it
-# always does.
+# User name for the SSH connections, for the machines that have nothing said about
+# them below. Left empty, you are ASKED before the connection is made -- the local
+# user name is offered as a suggestion, never applied on its own. A guest whose
+# account is "root" would make that suggestion plainly wrong, and a wrong guess
+# made confidently is worse than a question.
+# (Optional, Default empty)
+SSH_USER=''
+
+# User name per machine, keyed by the name of the domain. This is what a lab of
+# mixed guests wants: one of them answers to "root", another to your own name,
+# and neither should have to be typed twice.
 #
-# NOTE: For anything per machine -- a different user on one of them, a jump host,
-# a particular key -- "~/.ssh/config" is the place, and it is read here as it is
-# everywhere else:
+#   declare -A SSH_USERS=(
+#       [CentOS_7.X_AMD64_LBRAD]='root'
+#       [dev-box]='eduardolac'
+#   )
+#
+# (Optional, Default empty)
+declare -A SSH_USERS=()
+
+# NOTE: "~/.ssh/config" is read here as it is everywhere else, and is the better
+# place for anything ssh already knows how to express -- a jump host, a
+# particular key, a port:
 #
 #   Host 192.168.122.*
 #       User root
 #       IdentityFile ~/.ssh/id_lab
 #
-# (Optional, Default empty)
-SSH_USER=''
+# Leaving SSH_USER and SSH_USERS empty and answering the question with an empty
+# line hands the choice entirely to ssh, "User" lines included.
 
 # Port, when it is not 22.
 # (Optional, Default empty)

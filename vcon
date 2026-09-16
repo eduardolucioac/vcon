@@ -32,6 +32,7 @@ IP_TIMEOUT="${IP_TIMEOUT:-60}"
 SSH_USER="${SSH_USER:-}"
 SSH_PORT="${SSH_PORT:-}"
 [ -n "${SSH_OPTS+x}" ] || SSH_OPTS=()
+declare -A SSH_USERS 2> /dev/null || true
 
 # Credentials are libvirt's business, not this script's. Pointing at its auth file
 # is all that is needed; inventing a way to carry a password around here would be
@@ -269,6 +270,50 @@ ensure_running() {
     return 1
 }
 
+f_ssh_user_for() {
+    : 'Work out which user to connect as, and ask when nothing says.
+
+    Guessing is what this avoids. Falling back to the local user name is what ssh
+    does on its own, and on a guest whose account is "root" that is simply the
+    wrong answer given confidently -- so it is offered as a suggestion to accept,
+    never applied behind your back.
+
+    Args:
+        VM_NAME (str): Name of the domain.
+        IP_VALUE (str): Address it will connect to.
+
+    Returns:
+        The user name on the standard output, empty to let ssh decide by itself
+    (which is what honours a "User" line in "~/.ssh/config").'
+
+    local VM_NAME="$1"
+    local IP_VALUE="$2"
+    local HINT_VALUE=""
+    local ANSWER_VALUE=""
+
+    # Named for this machine: nothing to ask.
+    if [ -n "${SSH_USERS[$VM_NAME]:-}" ]; then
+        printf '%s' "${SSH_USERS[$VM_NAME]}"
+        return 0
+    fi
+
+    # Named for all of them: nothing to ask either.
+    if [ -n "$SSH_USER" ]; then
+        printf '%s' "$SSH_USER"
+        return 0
+    fi
+
+    # Nothing in the configuration, so ask. The hint is what ssh itself would use
+    # for this host, "~/.ssh/config" included, so an empty answer keeps its normal
+    # behaviour rather than overriding it.
+    HINT_VALUE="$(ssh -G "$IP_VALUE" 2> /dev/null | awk '/^user /{print $2; exit}')"
+
+    read -r -p "User for SSH on ${VM_NAME}${HINT_VALUE:+ [$HINT_VALUE]}: " \
+        ANSWER_VALUE < /dev/tty
+
+    printf '%s' "$ANSWER_VALUE"
+}
+
 f_wait_for_ip() {
     : 'Wait until a VM has an address, and give it back.
 
@@ -392,14 +437,16 @@ ip="$(f_wait_for_ip "$vm")" || {
     exit 1
 }
 
+ssh_user="$(f_ssh_user_for "$vm" "$ip")"
+
 SSH_CMD=(ssh)
 [ -n "${SSH_PORT:-}" ] && SSH_CMD+=(-p "$SSH_PORT")
 SSH_CMD+=(${SSH_OPTS[@]+"${SSH_OPTS[@]}"})
-SSH_CMD+=("${SSH_USER:+$SSH_USER@}$ip")
+SSH_CMD+=("${ssh_user:+$ssh_user@}$ip")
 
 trap restore_title EXIT INT TERM
 set_title "(ssh) ${vm} ${ip}"
-echo "Connecting to $vm ($ip) by SSH..."
+echo "Connecting to $vm (${ssh_user:+$ssh_user@}$ip) by SSH..."
 "${SSH_CMD[@]}"
 
 # vcon "inverted (c)" BSD-3-Clause

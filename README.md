@@ -20,6 +20,7 @@ work, or by **serial console** when the network is what broke.
    * [On the guest, for the serial console](#on-the-guest-for-the-serial-console)
 - [Installation](#installation)
 - [Configuration](#configuration)
+   * [Which user SSH connects as](#which-user-ssh-connects-as)
 - [Remote hosts and how they authenticate](#remote-hosts-and-how-they-authenticate)
    * [The one that catches people out](#the-one-that-catches-people-out)
    * [What the IP column means on a remote host](#what-the-ip-column-means-on-a-remote-host)
@@ -185,13 +186,39 @@ cp configs/config_model.bash configs/config.bash
 | `LIBVIRT_AUTH_FILE` | Where libvirt should look for credentials, for the connections that ask for them |
 | `START_TIMEOUT` | Seconds to wait for the console of a machine that was just started. Default `90` |
 | `IP_TIMEOUT` | Seconds to wait for a just-started machine to have an address. Default `60` |
-| `SSH_USER` | User name for SSH. Empty means your own, as `ssh` always does |
+| `SSH_USER` | User name for SSH. Empty means you are **asked** before connecting |
+| `SSH_USERS` | User name per machine, keyed by domain name |
 | `SSH_PORT` | Port for SSH, when it is not 22 |
 | `SSH_OPTS` | Anything else to hand to `ssh`, as an array |
 
-**TIP:** For anything per machine — a different user on one of them, a jump host,
-a particular key — `~/.ssh/config` is the place, and it is read here as it is
-everywhere else:
+### Which user SSH connects as
+
+**Nothing is guessed.** In order: what `SSH_USERS` says for that machine, then
+`SSH_USER`, then a question:
+
+```
+User for SSH on CentOS_7.X_AMD64_LBRAD [eduardolac]: 
+```
+
+The name in brackets is what `ssh` itself would use for that host, `~/.ssh/config`
+included. Accepting it is one keystroke, but it is a **suggestion** — a guest
+whose account is `root` would make it plainly wrong, and a wrong guess made
+confidently is worse than a question.
+
+An empty answer hands the choice to `ssh`, `User` lines and all.
+
+For a lab of mixed guests, name them once:
+
+```sh
+declare -A SSH_USERS=(
+    [CentOS_7.X_AMD64_LBRAD]='root'
+    [dev-box]='eduardolac'
+)
+```
+
+**TIP:** `~/.ssh/config` is read here as it is everywhere else, and is the better
+place for anything ssh already knows how to express — a jump host, a particular
+key, a port:
 
 ```
 Host 192.168.122.*
